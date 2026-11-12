@@ -70,17 +70,21 @@ def get_artifact_service():
 
 @functools.cache
 def get_memory_service():
-    """Process-wide memory service using VertexAiMemoryBankService."""
+    """Process-wide memory service using VertexAiMemoryBankService (or InMemory fallback)."""
     if uri := os.environ.get("MEMORY_SERVICE_URI"):
         from google.adk.cli.utils.service_factory import create_memory_service_from_options
         return create_memory_service_from_options(base_dir=_AGENT_DIR, memory_service_uri=uri)
-    from google.adk.memory.vertex_ai_memory_bank_service import VertexAiMemoryBankService
+    if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() in ("true", "1"):
+        from google.adk.memory.vertex_ai_memory_bank_service import VertexAiMemoryBankService
 
-    return VertexAiMemoryBankService(
-        project="qwiklabs-gcp-02-9285eef2192b",
-        location="us-central1",
-        agent_engine_id="5910349438563385344",
-    )
+        return VertexAiMemoryBankService(
+            project="qwiklabs-gcp-02-9285eef2192b",
+            location="us-central1",
+            agent_engine_id="5910349438563385344",
+        )
+    from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+
+    return InMemoryMemoryService()
 
 
 _registry = get_service_registry()

@@ -1,6 +1,7 @@
 import datetime
 import difflib
 import json
+import os
 import urllib.request
 import uuid
 from pathlib import Path
@@ -8,11 +9,12 @@ from zoneinfo import ZoneInfo
 
 from a2ui.basic_catalog.provider import BasicCatalog
 from a2ui.schema.manager import A2uiSchemaManager
+from dotenv import load_dotenv
 from google import genai
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.apps import App
-from google.adk.code_executors import AgentEngineSandboxCodeExecutor
+from google.adk.code_executors import AgentEngineSandboxCodeExecutor, UnsafeLocalCodeExecutor
 from google.adk.models import Gemini
 from google.adk.tools import ToolContext
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
@@ -20,6 +22,8 @@ from google.cloud import firestore, storage
 from google.genai import types
 
 from app.a2ui_utils import a2ui_callback
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # Hardcoded Project ID string & Bucket Name string required by Agent Engine / Agent Platform
 FIRESTORE_PROJECT_ID = "qwiklabs-gcp-02-9285eef2192b"
@@ -105,29 +109,75 @@ def hiragana_to_katakana(text: str) -> str:
     )
 
 
+_DDRAGON_CHAMP_CACHE: dict[str, str] = {}
+_DDRAGON_PROPER_ID: dict[str, str] = {}
+
+
+def _load_ddragon_champions() -> None:
+    """Loads all ~170 official Japanese & English champion names from Riot Data Dragon."""
+    if _DDRAGON_CHAMP_CACHE:
+        return
+    try:
+        ver_req = urllib.request.Request(
+            "https://ddragon.leagueoflegends.com/api/versions.json",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(ver_req, timeout=4) as resp:
+            latest_version = json.loads(resp.read().decode())[0]
+        ja_url = f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/ja_JP/champion.json"
+        ja_req = urllib.request.Request(ja_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(ja_req, timeout=5) as resp:
+            champ_dict = json.loads(resp.read().decode()).get("data", {})
+        for champ_id, info in champ_dict.items():
+            lower_id = champ_id.lower()
+            _DDRAGON_PROPER_ID[lower_id] = champ_id
+            ja_name = info.get("name", "").strip()
+            if ja_name:
+                _DDRAGON_CHAMP_CACHE[ja_name] = lower_id
+                # Also register without middle dot '・' or '＝'
+                clean_ja = ja_name.replace("・", "").replace("＝", "")
+                _DDRAGON_CHAMP_CACHE[clean_ja] = lower_id
+            _DDRAGON_CHAMP_CACHE[lower_id] = lower_id
+    except Exception:
+        pass
+
+
 def resolve_champion_name(raw_name: str) -> str:
     """Fuzzy resolves champion names even with typos, Hiragana, or spelling variations."""
+    _load_ddragon_champions()
     name = raw_name.strip()
-    katakana_name = hiragana_to_katakana(name)
+    katakana_name = hiragana_to_katakana(name).replace("・", "").replace("＝", "")
+
+    combined_map = {**_DDRAGON_CHAMP_CACHE, **CHAMPION_NAME_MAP}
 
     # 1. Exact match in Japanese map keys or English values
-    for k, v in CHAMPION_NAME_MAP.items():
-        if k == name or k == katakana_name or v == name.lower():
+    for k, v in combined_map.items():
+        k_clean = k.replace("・", "").replace("＝", "")
+        if k == name or k_clean == katakana_name or v == name.lower():
             return v
 
-    # 2. Substring match in keys
-    for k, v in CHAMPION_NAME_MAP.items():
-        if k in name or name in k or k in katakana_name or katakana_name in k:
-            return v
+    # 2. Substring match: only check if a known champion name (len >= 2) is contained in the input query
+    best_sub = None
+    best_len = 0
+    for k, v in combined_map.items():
+        k_clean = k.replace("・", "").replace("＝", "")
+        if len(k_clean) >= 2 and (k_clean in name or k_clean in katakana_name):
+            if len(k_clean) > best_len:
+                best_len = len(k_clean)
+                best_sub = v
+    if best_sub:
+        return best_sub
 
-    # 3. Fuzzy match against Japanese Katakana keys
-    matches = difflib.get_close_matches(katakana_name, list(CHAMPION_NAME_MAP.keys()), n=1, cutoff=0.3)
+    # 3. Safe fuzzy match against Japanese Katakana keys (high cutoff to avoid false positives)
+    matches = difflib.get_close_matches(
+        katakana_name, list(combined_map.keys()), n=1, cutoff=0.75
+    )
     if matches:
-        return CHAMPION_NAME_MAP[matches[0]]
+        return combined_map[matches[0]]
 
-    # 4. Fuzzy match against English champion names
-    eng_names = list(set(CHAMPION_NAME_MAP.values()))
-    matches_eng = difflib.get_close_matches(name.lower(), eng_names, n=1, cutoff=0.3)
+    # 4. Safe fuzzy match against English champion names
+    eng_names = list(set(combined_map.values()))
+    matches_eng = difflib.get_close_matches(name.lower(), eng_names, n=1, cutoff=0.75)
     if matches_eng:
         return matches_eng[0]
 
@@ -145,14 +195,71 @@ if metadata_path.exists():
     except Exception as e:
         print(f"Warning: Could not read deployment_metadata.json: {e}")
 
-code_executor = AgentEngineSandboxCodeExecutor(
-    agent_engine_resource_name=agent_engine_resource_name
-)
+_USE_VERTEXAI = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() in ("true", "1")
+
+if _USE_VERTEXAI and agent_engine_resource_name:
+    code_executor = AgentEngineSandboxCodeExecutor(
+        agent_engine_resource_name=agent_engine_resource_name
+    )
+else:
+    code_executor = UnsafeLocalCodeExecutor()
+
+# Local in-memory matchup fallback seeded from seed_firestore.py when Firestore ADC is unavailable
+LOCAL_MATCHUPS: dict[str, dict] = {
+    "yasuo": {
+        "champion_name": "Yasuo",
+        "lane": "Mid",
+        "recommended_counters": ["Renekton", "Vex", "Malphite", "Pantheon"],
+        "counter_reasons": "CC and burst champions overwhelm Yasuo's mobility. Renekton and Pantheon ignore Wind Wall and stun him instantly.",
+        "do_not_pick": ["Lux", "Vel'Koz", "Ahri"],
+        "do_not_pick_reasons": "Skillshot-reliant mages get blocked by Wind Wall and dashed on through minion waves.",
+        "playstyle_tips": "Bait Wind Wall (26s early CD). Pop his passive shield before all-in. Avoid fighting inside full enemy minion waves.",
+    },
+    "zed": {
+        "champion_name": "Zed",
+        "lane": "Mid",
+        "recommended_counters": ["Lissandra", "Garen", "Malphite"],
+        "counter_reasons": "Lissandra R completely negates Death Mark. Point-and-click CC and armor shut down his assassination combos.",
+        "do_not_pick": ["Veigar", "Xerath", "Ziggs"],
+        "do_not_pick_reasons": "Immobile squishy mages are free targets for Zed's Death Mark at level 6.",
+        "playstyle_tips": "Track his Shadow (W) cooldown. Rush Zhonya's Hourglass or Seeker's Armguard. Ping missing immediately.",
+    },
+    "darius": {
+        "champion_name": "Darius",
+        "lane": "Top",
+        "recommended_counters": ["Vayne", "Quinn", "Wukong", "Yorick"],
+        "counter_reasons": "Ranged kiting prevents Darius from landing Apprehend (E). Clones and pets block his targeted abilities.",
+        "do_not_pick": ["Sion", "Nautilus", "Garen", "Nasus"],
+        "do_not_pick_reasons": "Melee tanks give Darius free Hemorrhage 5-stacks and true damage ultimate resets.",
+        "playstyle_tips": "Dodge the outer blade of Q to prevent his healing. Never take extended trades past 3 Hemorrhage stacks.",
+    },
+    "ahri": {
+        "champion_name": "Ahri",
+        "lane": "Mid",
+        "recommended_counters": ["Yasuo", "Tristana", "Sylas"],
+        "counter_reasons": "Yasuo Wind Wall blocks Charm (E) and Orb (Q). Tristana and Sylas out-trade her all-in damage early.",
+        "do_not_pick": ["Lux", "Taliyah"],
+        "do_not_pick_reasons": "Ahri's Spirit Rush (R) easily dodges slow skillshots and catches immobile mages.",
+        "playstyle_tips": "Stand behind minions to block Charm. Trade when Charm is on cooldown (12s+).",
+    },
+    "pantheon": {
+        "champion_name": "Pantheon",
+        "lane": "Top / Mid / Support",
+        "recommended_counters": ["Ornn", "Malphite", "Gragas", "Morgana"],
+        "counter_reasons": "Tanks and displacement CC neutralize Pantheon's point-and-click stun (W) and Aegis Assault (E).",
+        "do_not_pick": ["Yasuo", "Kassadin", "Twisted Fate"],
+        "do_not_pick_reasons": "Point-and-click stun and Aegis Assault (E) block all frontal damage and interrupt squishy combos.",
+        "playstyle_tips": "Respect his empowered W level 1-3 all-in. Wait out Aegis Assault (E) shield before throwing major damage skills.",
+    },
+}
 
 
 async def generate_memories_callback(callback_context: CallbackContext):
     """WRITE: after each turn, send the session to Memory Bank for extraction."""
-    await callback_context.add_session_to_memory()
+    try:
+        await callback_context.add_session_to_memory()
+    except Exception:
+        pass
     return None
 
 
@@ -174,54 +281,64 @@ def generate_champion_avatar(champion_name: str, tool_context: ToolContext = Non
     raw_name = champion_name.strip()
     eng_name = resolve_champion_name(raw_name).capitalize()
 
-    genai_client = genai.Client(
-        vertexai=True,
-        project=FIRESTORE_PROJECT_ID,
-        location="global",
-    )
+    try:
+        if _USE_VERTEXAI:
+            genai_client = genai.Client(
+                vertexai=True,
+                project=FIRESTORE_PROJECT_ID,
+                location="global",
+            )
+        else:
+            genai_client = genai.Client()
 
-    prompt = (
-        f"A dramatic, vibrant, high-quality League of Legends champion portrait avatar of {eng_name}, "
-        "epic fantasy game art style, detailed character lighting, colorful background."
-    )
+        prompt = (
+            f"A dramatic, vibrant, high-quality League of Legends champion portrait avatar of {eng_name}, "
+            "epic fantasy game art style, detailed character lighting, colorful background."
+        )
 
-    response = genai_client.models.generate_content(
-        model="gemini-3.1-flash-lite-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["TEXT", "IMAGE"],
-        ),
-    )
+        response = genai_client.models.generate_content(
+            model="gemini-3.1-flash-lite-image",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+            ),
+        )
 
-    image_bytes = None
-    mime_type = "image/jpeg"
+        image_bytes = None
+        mime_type = "image/jpeg"
 
-    if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-        for part in response.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.data:
-                image_bytes = part.inline_data.data
-                if part.inline_data.mime_type:
-                    mime_type = part.inline_data.mime_type
-                break
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data and part.inline_data.data:
+                    image_bytes = part.inline_data.data
+                    if part.inline_data.mime_type:
+                        mime_type = part.inline_data.mime_type
+                    break
 
-    if not image_bytes:
-        return f"Failed to generate image for champion '{champion_name}'."
+        if image_bytes:
+            filename = f"{eng_name.lower()}_avatar.jpg"
+            if tool_context:
+                part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+                tool_context.save_artifact(filename=filename, artifact=part)
 
-    # (1) Save with tool_context.save_artifact so it shows up in Playground's Artifacts panel
-    filename = f"{eng_name.lower()}_avatar.jpg"
-    if tool_context:
-        part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-        tool_context.save_artifact(filename=filename, artifact=part)
+            if _USE_VERTEXAI:
+                storage_client = storage.Client(project=FIRESTORE_PROJECT_ID)
+                bucket = storage_client.bucket(GCS_BUCKET_NAME)
+                blob_name = f"avatars/{eng_name.lower()}_{uuid.uuid4().hex[:8]}.jpg"
+                blob = bucket.blob(blob_name)
+                blob.upload_from_string(image_bytes, content_type=mime_type)
+                return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{blob.name}"
+            else:
+                avatars_dir = Path(__file__).parent.parent / "frontend" / "static" / "avatars"
+                avatars_dir.mkdir(parents=True, exist_ok=True)
+                local_name = f"{eng_name.lower()}_{uuid.uuid4().hex[:8]}.jpg"
+                (avatars_dir / local_name).write_bytes(image_bytes)
+                port = os.environ.get("PORT", "8080")
+                return f"http://localhost:{port}/avatars/{local_name}"
+    except Exception:
+        pass
 
-    # (2) Upload same image bytes to public Cloud Storage bucket
-    storage_client = storage.Client(project=FIRESTORE_PROJECT_ID)
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
-    blob_name = f"avatars/{eng_name.lower()}_{uuid.uuid4().hex[:8]}.jpg"
-    blob = bucket.blob(blob_name)
-    blob.upload_from_string(image_bytes, content_type=mime_type)
-
-    public_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{blob.name}"
-    return public_url
+    return f"https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{eng_name}_0.jpg"
 
 
 def get_champion_live_stats(champion_name: str) -> str:
@@ -234,7 +351,8 @@ def get_champion_live_stats(champion_name: str) -> str:
         A summary string of live stats (HP, Armor, MR, Attack Damage, Attack Range) and patch version.
     """
     raw_name = champion_name.strip()
-    eng_name = resolve_champion_name(raw_name).capitalize()
+    resolved = resolve_champion_name(raw_name)
+    eng_name = _DDRAGON_PROPER_ID.get(resolved, resolved.capitalize())
 
     try:
         ver_req = urllib.request.Request(
@@ -280,27 +398,40 @@ def get_matchup_info(champion_name: str) -> str:
     Returns:
         A summary string of matchup details including recommended counters, reasons, do-not-pick champions, and playstyle tips.
     """
-    db = get_firestore_client()
     raw_name = champion_name.strip()
     doc_id = resolve_champion_name(raw_name)
+    data = None
 
-    doc_ref = db.collection("matchups").document(doc_id)
-    doc = doc_ref.get()
+    if _USE_VERTEXAI:
+        try:
+            db = get_firestore_client()
+            doc_ref = db.collection("matchups").document(doc_id)
+            doc = doc_ref.get()
+            if not doc.exists:
+                docs = list(db.collection("matchups").stream())
+                for d in docs:
+                    d_data = d.to_dict()
+                    champ = d_data.get("champion_name", "").lower()
+                    if raw_name.lower() in champ or champ in raw_name.lower() or d.id == doc_id:
+                        doc = d
+                        break
+            if doc.exists:
+                data = doc.to_dict()
+        except Exception:
+            data = None
 
-    if not doc.exists:
-        # Fallback: search all documents in matchups collection for partial name match
-        docs = list(db.collection("matchups").stream())
-        for d in docs:
-            d_data = d.to_dict()
-            champ = d_data.get("champion_name", "").lower()
-            if raw_name.lower() in champ or champ in raw_name.lower() or d.id == doc_id:
-                doc = d
-                break
+    if data is None:
+        data = LOCAL_MATCHUPS.get(doc_id)
+        if data is None:
+            for k, v in LOCAL_MATCHUPS.items():
+                champ = v.get("champion_name", "").lower()
+                if raw_name.lower() in champ or champ in raw_name.lower() or k == doc_id:
+                    data = v
+                    break
 
-    if not doc.exists:
-        return f"No matchup information found in Firestore database for champion '{champion_name}'."
+    if not data:
+        return f"No matchup information found in database for champion '{champion_name}'."
 
-    data = doc.to_dict()
     champ = data.get("champion_name", champion_name)
     lane = data.get("lane", "Unknown")
     counters = ", ".join(data.get("recommended_counters", []))
@@ -342,7 +473,6 @@ def add_or_update_matchup(
     Returns:
         A confirmation message indicating success.
     """
-    db = get_firestore_client()
     doc_id = resolve_champion_name(champion_name)
 
     data = {
@@ -355,8 +485,14 @@ def add_or_update_matchup(
         "playstyle_tips": playstyle_tips,
     }
 
-    db.collection("matchups").document(doc_id).set(data)
-    return f"Successfully saved matchup data for {champion_name} ({lane}) to Firestore database."
+    LOCAL_MATCHUPS[doc_id] = data
+    if _USE_VERTEXAI:
+        try:
+            db = get_firestore_client()
+            db.collection("matchups").document(doc_id).set(data)
+        except Exception:
+            pass
+    return f"Successfully saved matchup data for {champion_name} ({lane}) to database."
 
 
 schema_manager = A2uiSchemaManager(
@@ -380,6 +516,11 @@ instruction = schema_manager.generate_system_prompt(
         "- Always frame advice from a Pro League of Legends Coach perspective (プロ・元プロのアナリスト・コーチ視点).\n"
         "- Explicitly mention wave management (ウェーブ管理: 3ウェーブ・スロープッシュ, タワー下フリーズ, リコールタイミング), cool-down punish (スキルクールダウンのスキを突く), item/level power spikes (レベル2ファーストタッチ, レベル6スパイク, コアアイテム完成時), and macro roams.\n"
         "- Example advice style: '【プロ・元プロ視点のアドバイス】ヤスオW(風の壁)はCD26秒です。プロ戦術ではWを使わせた瞬間に26秒間のウィンドウでジャングルを呼ぶかスロープッシュで圧をかけます。'\n\n"
+        "STRICT DISTINCTION BETWEEN COUNTER PICKS AND DO-NOT-PICK (推奨カウンターとNG不利ピックの厳密な区別):\n"
+        "- When a user asks how to counter Opponent X ('Xの対策' or 'Xのカウンター'):\n"
+        "  1. `✅ 推奨カウンターピック（対Xに有利な自軍チャンプ）`: Champions YOU should pick to BEAT Opponent X.\n"
+        "  2. `❌ 出してはいけない不利ピック（対Xに不利なNG自軍チャンプ）`: Champions YOU must NEVER pick against Opponent X because Opponent X hard-counters them.\n"
+        "- NEVER put the same champion in both `推奨カウンターピック` and `出してはいけない不利ピック`, and NEVER confuse 'champions strong against X' with 'champions weak against X'.\n\n"
         "MEMORY & PERSONALIZATION (記憶・パーソナライズ):\n"
         "- Actively remember the user's main champion pool (よく使用するチャンピオン / メインチャンピオン), preferred lanes, and playstyle.\n"
         "- Whenever giving advice, tailor recommendations specifically to the user's remembered champion pool when relevant.\n\n"
@@ -395,16 +536,25 @@ instruction = schema_manager.generate_system_prompt(
         "Use ONLY these components: Card, Column, Row, Text, and Image. Do not use "
         "Table or Heading (unsupported), or Buttons, actions, or forms (they do "
         "nothing in adk web). "
-        "You may include one Image component, but only when you have a public https "
-        "URL for the image (for example the URL an image tool returns after uploading "
-        "to a public bucket). Set the Image url to that exact https link, for example "
-        "{\"Image\": {\"url\": {\"literalString\": \"https://...\"}}}. Never point an "
-        "Image at a bare filename, an artifact name, or a non-http(s) path. If you do "
-        "not have a public URL, add a short Text line noting the image instead. "
-        "No markdown in text; use the usageHint property ('h1', 'h2', 'body') for "
+        "You may include one Image component, but only when you have a public http(s) "
+        "URL for the image. Set the Image url to that exact link, for example "
+        "{\"Image\": {\"url\": {\"literalString\": \"https://...\"}}}. "
+        "No markdown in text; use the usageHint property ('h1', 'h2', 'h3', 'body') for "
         "headings and emphasis. "
-        "Output ONLY the raw A2UI JSON array — no prose, and never wrap it in "
-        "<a2a_datapart_json> tags or 'kind'/'data'/'metadata' objects."
+        "Follow this exact A2UI v0.8 JSON structure inside <a2ui-json>...</a2ui-json>:\n"
+        "<a2ui-json>\n"
+        "[\n"
+        "  {\"beginRendering\": {\"surfaceId\": \"main\", \"root\": \"card_root\"}},\n"
+        "  {\"surfaceUpdate\": {\"surfaceId\": \"main\", \"components\": [\n"
+        "    {\"id\": \"card_root\", \"component\": {\"Card\": {\"child\": \"col_main\"}}},\n"
+        "    {\"id\": \"col_main\", \"component\": {\"Column\": {\"children\": {\"explicitList\": [\"t_title\", \"t_counters\", \"t_bad\", \"t_tips\"]}}}},\n"
+        "    {\"id\": \"t_title\", \"component\": {\"Text\": {\"text\": {\"literalString\": \"⚔️ [対面チャンピオン名] 対策ガイド\"}, \"usageHint\": \"h1\"}}},\n"
+        "    {\"id\": \"t_counters\", \"component\": {\"Text\": {\"text\": {\"literalString\": \"✅ 推奨カウンター（有利ピック）: [有利なチャンプ名と理由]\"}, \"usageHint\": \"h3\"}}},\n"
+        "    {\"id\": \"t_bad\", \"component\": {\"Text\": {\"text\": {\"literalString\": \"❌ 出してはいけないNGピック（不利対面）: [この相手にカモにされる出してはいけないチャンプ名と理由]\"}, \"usageHint\": \"body\"}}},\n"
+        "    {\"id\": \"t_tips\", \"component\": {\"Text\": {\"text\": {\"literalString\": \"💡 【プロ・元プロ視点のアドバイス】...\"}, \"usageHint\": \"body\"}}}\n"
+        "  ]}}\n"
+        "]\n"
+        "</a2ui-json>"
     ),
     include_schema=True,
     include_examples=True,
@@ -413,7 +563,7 @@ instruction = schema_manager.generate_system_prompt(
 root_agent = Agent(
     name="root_agent",
     model=Gemini(
-        model="gemini-flash-latest",
+        model=os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview"),
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=instruction,

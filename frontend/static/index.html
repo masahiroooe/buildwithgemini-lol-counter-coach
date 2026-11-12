@@ -648,17 +648,37 @@ function flattenText(messages) {
 }
 
 function detectAndUpdateChampion(fullText) {
+  if (!fullText) return false;
+  const lower = fullText.toLowerCase();
+  let bestMatch = null;
+  let bestIndex = Infinity;
+  let bestLen = 0;
+
   for (const [jpKey, engName] of Object.entries(CHAMPION_NAME_MAP)) {
-    if (fullText.toLowerCase().includes(jpKey.toLowerCase()) || fullText.includes(engName)) {
-      championThumb.src = `https://ddragon.leagueoflegends.com/cdn/16.19.1/img/champion/${engName}.png`;
-      spotlightName.textContent = `${jpKey.toUpperCase()} (${engName})`;
-      
-      // Update Left Panel Splash Art Background
-      const splashUrl = `https://ddragon.leagueoflegends.com/cdn/img/champion/splash/${engName}_0.jpg`;
-      spotlightPanel.style.backgroundImage = `url('${splashUrl}')`;
-      return;
+    const idxJp = lower.indexOf(jpKey.toLowerCase());
+    const idxEng = lower.indexOf(engName.toLowerCase());
+    let idx = -1;
+    if (idxJp !== -1 && idxEng !== -1) idx = Math.min(idxJp, idxEng);
+    else if (idxJp !== -1) idx = idxJp;
+    else if (idxEng !== -1) idx = idxEng;
+
+    if (idx !== -1) {
+      if (idx < bestIndex || (idx === bestIndex && jpKey.length > bestLen)) {
+        bestIndex = idx;
+        bestLen = jpKey.length;
+        bestMatch = { jpKey, engName };
+      }
     }
   }
+
+  if (bestMatch) {
+    championThumb.src = `https://ddragon.leagueoflegends.com/cdn/16.19.1/img/champion/${bestMatch.engName}.png`;
+    spotlightName.textContent = `${bestMatch.jpKey.toUpperCase()} (${bestMatch.engName})`;
+    const splashUrl = `https://ddragon.leagueoflegends.com/cdn/img/champion/splash/${bestMatch.engName}_0.jpg`;
+    spotlightPanel.style.backgroundImage = `url('${splashUrl}')`;
+    return true;
+  }
+  return false;
 }
 
 function renderReply(b, parts) {

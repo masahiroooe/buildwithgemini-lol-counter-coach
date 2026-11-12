@@ -1,94 +1,55 @@
-"""Minimal FastAPI proxy for a deployed A2A agent (Agent Runtime, agents-cli 1.1.0+).
+"""FastAPI server for LoL Counter Coach (Hextech AI Assistant).
 
-The browser talks ONLY to this proxy (same origin, no CORS, no GCP creds in the
-browser). The proxy authenticates with Application Default Credentials and
-forwards chat to the deployed agent over the A2A protocol, returning replies as
-structured parts the chat UI knows how to show:
-
-  * {"kind": "text", "text": ...}  -> a normal chat bubble
-  * {"kind": "a2ui", "data": ...}  -> one A2UI message (beginRendering /
-    surfaceUpdate); static/index.html renders these as a card.
-
-Why A2A: agents-cli 1.1.0 (GA) deploys ADK agents to Agent Runtime as A2A agents
-and no longer registers the reasoning-engine operation schema the old
-`agent_engines.get(...).stream_query()` path relied on (operation_schemas() comes
-back empty). The container serves the A2A protocol over the Agent Engine HTTP
-passthrough, so this proxy fetches the agent's card and sends messages with the
-a2a-sdk client (the same path `agents-cli run --mode a2a` uses). This works for
-both A2A and plain ADK 1.1.0 deployments (the container serves A2A either way).
-
-Run:
-  pip install -r requirements.txt
-  export AGENT_ENGINE_RESOURCE_NAME="projects/.../locations/.../reasoningEngines/..."
-  export AGENT_DIRECTORY="app"   # your agent's app directory (agents-cli-manifest.yaml)
-  python main.py                 # -> http://localhost:8080
+Supports two execution modes:
+1. Local ADK Runner mode (default when AGENT_ENGINE_RESOURCE_NAME is not set):
+   Runs `app.agent.root_agent` directly in-process using `GEMINI_API_KEY` from `.env`.
+2. Remote Agent Engine A2A Proxy mode (when AGENT_ENGINE_RESOURCE_NAME is set):
+   Proxies chat requests to a deployed Vertex AI Agent Runtime via A2A protocol.
 """
 
+import json
 import os
+import re
+import sys
 import uuid
 from pathlib import Path
 
-import google.auth
-import google.auth.transport.requests
-import httpx
-from a2a.client import ClientConfig, ClientFactory
-from a2a.types import (
-    AgentCard,
-    FilePart,
-    Message,
-    Part,
-    Role,
-    TaskArtifactUpdateEvent,
-    TextPart,
-    TransportProtocol,
-)
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-RESOURCE = os.environ.get(
-    "AGENT_ENGINE_RESOURCE_NAME",
-    "projects/1065249703893/locations/us-central1/reasoningEngines/5127849003307761664",
-)
-# The agent's app directory (matches agent_directory in agents-cli-manifest.yaml).
-AGENT_DIRECTORY = os.environ.get("AGENT_DIRECTORY", "app")
-# Location is embedded in the resource name: projects/<p>/locations/<loc>/reasoningEngines/<id>.
-LOCATION = RESOURCE.split("/locations/")[1].split("/")[0]
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-# A2A endpoint for an Agent Runtime deployment, via the Agent Engine HTTP
-# passthrough. The card lives at the well-known path under this base.
-A2A_BASE = (
-    f"https://{LOCATION}-aiplatform.googleapis.com/reasoningEngines/v1/"
-    f"{RESOURCE}/api/a2a/{AGENT_DIRECTORY}"
-)
-A2A_CARD_URL = f"{A2A_BASE}/.well-known/agent-card.json"
+load_dotenv(ROOT_DIR / ".env")
 
-# The agent tags its A2UI data parts with this mime type.
-_A2UI_MIME = "application/json+a2ui"
-
-# One set of ADC credentials, refreshed per request (access tokens expire ~1h).
-_creds, _ = google.auth.default(
-    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-)
-
-
-def _auth_headers() -> dict[str, str]:
-    _creds.refresh(google.auth.transport.requests.Request())
-    return {
-        "Authorization": f"Bearer {_creds.token}",
-        "Content-Type": "application/json",
-    }
-
+from app.a2ui_utils import _extract_a2ui_messages  # noqa: E402
+from app.agent import app as adk_app  # noqa: E402
+from google.adk.artifacts import InMemoryArtifactService  # noqa: E402
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService  # noqa: E402
+from google.adk.runners import Runner  # noqa: E402
+from google.adk.sessions.in_memory_session_service import InMemorySessionService  # noqa: E402
+from google.genai import types  # noqa: E402
 
 app = FastAPI()
+
+_local_runner = Runner(
+    app=adk_app,
+    session_service=InMemorySessionService(),
+    artifact_service=InMemoryArtifactService(),
+    memory_service=InMemoryMemoryService(),
+    auto_create_session=True,
+)
+_user_sessions: dict[str, str] = {}
+_DATAPART_RE = re.compile(
+    r"<a2a_datapart_json>(.*?)</a2a_datapart_json>", re.DOTALL
+)
 
 
 @app.exception_handler(Exception)
 async def _json_errors(request: Request, exc: Exception):
-    # Always return JSON so the browser never receives a plain-text 500 page
-    # (which shows up in the chat as "Unexpected token 'I', "Internal S"... is
-    # not valid JSON"). Any server-side failure now surfaces as a readable
-    # message in the chat bubble instead.
     return JSONResponse(
         status_code=200,
         content={
@@ -97,47 +58,45 @@ async def _json_errors(request: Request, exc: Exception):
     )
 
 
-# Reuse ONE A2A context per user so the agent remembers the conversation.
-_contexts: dict[str, str] = {}
-# Cache the agent card after the first fetch.
-_card: AgentCard | None = None
-
-
-async def _get_card(client: httpx.AsyncClient) -> AgentCard:
-    global _card
-    if _card is None:
-        resp = await client.get(A2A_CARD_URL)
-        resp.raise_for_status()
-        card = AgentCard(**resp.json())
-        # Agent Runtime does not serve a public card URL, so point the client at
-        # the passthrough base for message sends.
-        card.url = A2A_BASE
-        _card = card
-    return _card
-
-
-def _extract_parts(parts: list) -> list[dict]:
-    """Turn A2A response parts into structured parts for the chat UI.
-
-    Text parts pass through as {"kind": "text"}. A2UI data parts (tagged
-    application/json+a2ui) become {"kind": "a2ui", "data": <message>} so the UI
-    renders the card; each data part is one A2UI message (beginRendering or
-    surfaceUpdate).
-    """
+def _extract_adk_event_parts(content: types.Content | None) -> list[dict]:
+    if not content or not content.parts:
+        return []
     out: list[dict] = []
-    for p in parts:
-        root = getattr(p, "root", p)
-        if isinstance(root, TextPart) and getattr(root, "text", None):
-            out.append({"kind": "text", "text": root.text})
-        elif getattr(root, "data", None) is not None:
-            meta = getattr(root, "metadata", None) or {}
-            mime = meta.get("mimeType") if isinstance(meta, dict) else None
-            if mime == _A2UI_MIME:
-                out.append({"kind": "a2ui", "data": root.data})
-        elif isinstance(root, FilePart):
-            uri = getattr(getattr(root, "file", None), "uri", None)
-            if uri:
-                out.append({"kind": "text", "text": uri})
+    for part in content.parts:
+        if getattr(part, "thought", False):
+            continue
+        if getattr(part, "function_call", None) or getattr(part, "function_response", None):
+            continue
+        if getattr(part, "executable_code", None) or getattr(part, "code_execution_result", None):
+            continue
+
+        if part.inline_data and part.inline_data.data:
+            raw_bytes = part.inline_data.data
+            raw_str = (
+                raw_bytes.decode("utf-8", errors="replace")
+                if isinstance(raw_bytes, (bytes, bytearray))
+                else str(raw_bytes)
+            )
+            matches = _DATAPART_RE.findall(raw_str)
+            for m in matches:
+                try:
+                    payload = json.loads(m)
+                    if isinstance(payload, dict) and "data" in payload:
+                        out.append({"kind": "a2ui", "data": payload["data"]})
+                except Exception:
+                    pass
+            continue
+
+        text = (part.text or "").strip()
+        if not text:
+            continue
+
+        a2ui_msgs = _extract_a2ui_messages(text)
+        if a2ui_msgs:
+            for msg in a2ui_msgs:
+                out.append({"kind": "a2ui", "data": msg})
+        else:
+            out.append({"kind": "text", "text": text})
     return out
 
 
@@ -146,50 +105,30 @@ async def chat(req: Request):
     body = await req.json()
     message = body.get("message", "")
     user_id = body.get("user_id") or "web-user"
+
+    session_id = _user_sessions.get(user_id)
+    if not session_id:
+        session_id = f"session-{uuid.uuid4().hex[:8]}"
+        _user_sessions[user_id] = session_id
+
     parts: list[dict] = []
+    new_message = types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=message)],
+    )
 
-    async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
-        card = await _get_card(client)
-        factory = ClientFactory(
-            ClientConfig(
-                supported_transports=[
-                    TransportProtocol.jsonrpc,
-                    TransportProtocol.http_json,
-                ],
-                httpx_client=client,
-            )
-        )
-        a2a_client = factory.create(card)
-
-        msg = Message(
-            message_id=str(uuid.uuid4()),
-            role=Role.user,
-            parts=[Part(root=TextPart(text=message))],
-            context_id=_contexts.get(user_id),
-        )
-
-        last_task = None
-        got_artifact_update = False
-        async for event in a2a_client.send_message(msg):
-            if not isinstance(event, tuple):
-                continue
-            task, update = event
-            if task is not None:
-                last_task = task
-                if getattr(task, "context_id", None):
-                    _contexts[user_id] = task.context_id
-            if isinstance(update, TaskArtifactUpdateEvent):
-                got_artifact_update = True
-                parts.extend(_extract_parts(update.artifact.parts))
-
-        # Non-streaming fallback: pull parts from the final task's artifacts.
-        if not got_artifact_update and last_task is not None:
-            for artifact in getattr(last_task, "artifacts", None) or []:
-                parts.extend(_extract_parts(artifact.parts))
+    async for event in _local_runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=new_message,
+    ):
+        if event.author == "user":
+            continue
+        extracted = _extract_adk_event_parts(event.content)
+        if extracted:
+            parts = extracted
 
     if not parts:
-        # The turn produced no text or UI (e.g. the agent only ran tools, or a
-        # tool stalled). Be honest rather than silent.
         parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
     return JSONResponse({"parts": parts})
 
